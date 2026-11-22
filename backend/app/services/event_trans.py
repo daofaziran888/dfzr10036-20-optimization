@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services import field_version as fv
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -16,6 +17,49 @@ class EventTransService(BaseModuleService):
     STATUS_ORDER = ["草稿", "转换中", "转换过载", "已停止"]
     ACTION_RULES = {"启动转换": "转换中", "扩容处理": "转换过载", "停止管道": "已停止"}
     NEGATIVE_ACTIONS = []
+
+    def refresh_conversion_batch(self, entry_id: int) -> dict[str, Any] | None:
+        """刷新转换批次：核对实际采用的列与解码依据，并检查解析侧是否已有更新版本。
+
+        返回当前转换批次实际采用的列、对应的解码批次与字段版本；
+        若解析侧已生效更新版本而本管道尚未消费，一并给出新版首个消费批次。
+        """
+        entry = self.get_entry(entry_id)
+        if entry is None:
+            return None
+
+        source = str(entry.get("源端", ""))
+        table = str(entry.get("影响表") or fv.table_for_source(source))
+        key = fv.version_key(source, table)
+        rule = next(
+            (r for r in store.rows("binlog_parse") if str(r.get("源端", "")) == source),
+            None,
+        )
+        effective_id = None
+        if rule is not None:
+            env, _ = fv.resolve_effective(rule, key)
+            effective_id = str(env["字段版本"])
+
+        adopted_id = str(entry.get("字段版本", ""))
+        newer_batches = []
+        if rule is not None and effective_id:
+            newer_batches = [
+                b for b in rule.get("解码批次", [])
+                if str(b.get("影响表", "")) == table
+                and str(b.get("字段版本", "")) == effective_id
+                and b.get("状态") == "已交接"
+            ]
+        return {
+            "管道编号": entry.get("管道编号", ""),
+            "转换批次": entry.get("转换批次", "尚未交接"),
+            "采用列": entry.get("采用列", ""),
+            "解码依据": entry.get("最近解码依据", ""),
+            "字段版本": adopted_id or "（未消费版本数据）",
+            "解析侧生效版本": effective_id,
+            "有新版待消费": bool(effective_id) and adopted_id != effective_id,
+            "新版首个消费批次": newer_batches[0]["批次号"] if newer_batches else None,
+            "批次历史": entry.get("批次历史", []),
+        }
 
     def trigger_dim_join_and_dedup(self, entry_id: int) -> dict[str, Any]:
         """事件转换管道启动后，级联创建维表关联和去重窗口。

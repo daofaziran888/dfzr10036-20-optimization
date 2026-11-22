@@ -18,6 +18,7 @@ from app.services.checkpoint import CheckpointService
 from app.services.iceberg_commit import IcebergCommitService
 from app.services.compaction import CompactionService
 from app.services.ddl_handle import DdlHandleService
+from app.services.schema_evo import SchemaEvoService
 
 
 cdc_source = CdcSourceService()
@@ -32,6 +33,7 @@ checkpoint = CheckpointService()
 iceberg_commit = IcebergCommitService()
 compaction = CompactionService()
 ddl_handle = DdlHandleService()
+schema_evo = SchemaEvoService()
 
 
 def flow_cdc_to_lake(cdc_entry_id: int) -> dict[str, Any]:
@@ -126,23 +128,92 @@ def flow_lag_recovery(cdc_entry_id: int) -> dict[str, Any]:
 
 
 def flow_ddl_propagation(ddl_entry_id: int) -> dict[str, Any]:
-    """主线链路3: DDL适配→Binlog调整→Schema演进
+    """主线链路3: DDL适配→字段版本→Binlog调整→Schema演进（幂等可恢复）
 
     调用数: 4+
     """
     trace: list[str] = []
 
-    # 1. DDL应用 → binlog调整 + schema记录
+    # 1. DDL应用 → 字段版本双边落账（映射登载 + 演进登记，同一信封同一指纹）
     result = ddl_handle.trigger_binlog_and_schema_evo(ddl_entry_id)
     if result is None:
         return {"ok": False, "step": "ddl_handle", "message": "DDL未应用或不存在"}
+    if result.get("outcome") == "conflict":
+        return {"ok": False, "step": "field_version", "message": "版本指纹冲突，需人工核对"}
 
+    version = result.get("version") or {}
     if result.get("binlog"):
-        trace.append(f"ddl_handle#{ddl_entry_id} -> binlog_parse#{result['binlog']['id']}")
+        trace.append(
+            f"ddl_handle#{ddl_entry_id} -> binlog_parse#{result['binlog']['id']}"
+            f"（{version.get('字段版本', '?')}）"
+        )
     if result.get("schema"):
-        trace.append(f"ddl_handle#{ddl_entry_id} -> schema_evo#{result['schema']['id']}")
+        trace.append(
+            f"ddl_handle#{ddl_entry_id} -> schema_evo#{result['schema']['id']}"
+            f"（指纹{version.get('映射指纹', '?')}）"
+        )
 
-    return {"ok": True, "trace": trace, "call_count": len(trace)}
+    return {
+        "ok": True,
+        "trace": trace,
+        "call_count": len(trace),
+        "outcome": result.get("outcome"),
+        "version": version,
+    }
+
+
+def flow_parse_decode(rule_id: int, table: str | None = None) -> dict[str, Any]:
+    """主线链路9: 解码批次→版本核验→同步交接事件转换→刷新转换批次
+
+    调用数: 3+
+    """
+    trace: list[str] = []
+
+    # 1. 开始解码批次：只消费一组可核验的完整映射
+    result = binlog_parse.start_decode_batch(rule_id, table)
+    if result is None:
+        return {"ok": False, "step": "binlog_parse", "message": "规则不存在或未在解析中"}
+    batch = result["batch"]
+    trace.append(f"binlog_parse#{rule_id} 解码批次{batch['批次号']} 消费{batch['字段版本']}")
+
+    # 2. 解析结果同步交接事件转换（解码依据已随批次附上）
+    refresh = None
+    if result.get("pipeline"):
+        trace.append(
+            f"binlog_parse#{rule_id} -> event_trans#{result['pipeline']['id']}"
+            f"（{batch['转换批次']}）"
+        )
+        # 3. 刷新转换批次，核对实际采用的列
+        refresh = event_trans.refresh_conversion_batch(result["pipeline"]["id"])
+
+    return {"ok": True, "trace": trace, "call_count": len(trace),
+            "batch": batch, "refresh": refresh}
+
+
+def flow_ddl_recovery(ddl_entry_id: int) -> dict[str, Any]:
+    """主线链路10: DDL传播中断恢复→补做演进写入/补登映射（不重复已确认版本）
+
+    调用数: 2+
+    """
+    result = ddl_handle.recover_interrupted(ddl_entry_id)
+    if result is None:
+        return {"ok": False, "step": "ddl_handle", "message": "DDL未应用或不存在"}
+    version = (result.get("result") or {}).get("version") or {}
+    trace = [
+        f"ddl_handle#{ddl_entry_id} 恢复动作={result['action']}"
+        f"（{version.get('字段版本', '-')}）"
+    ]
+    return {"ok": True, "trace": trace, "call_count": len(trace), **result}
+
+
+def flow_version_audit(source: str, table: str) -> dict[str, Any]:
+    """主线链路11: 版本交接核对→已有批次能否继续/旧版产出/新版消费起点
+
+    调用数: 2+
+    """
+    report = schema_evo.audit_version_handoff(source, table)
+    trace = [f"schema_evo 核对{report['版本键']} 完整性{len(report['完整性'])}项"]
+    return {"ok": True, "trace": trace, "call_count": len(trace), "report": report}
 
 
 def flow_commit_failure_recovery(commit_entry_id: int) -> dict[str, Any]:
@@ -243,4 +314,7 @@ FLOWS: dict[str, Any] = {
     "out_of_order_to_checkpoint": flow_out_of_order_to_checkpoint,
     "rate_propagation": flow_rate_propagation,
     "sink_block_to_compaction": flow_sink_block_to_compaction,
+    "parse_decode": flow_parse_decode,
+    "ddl_recovery": flow_ddl_recovery,
+    "version_audit": flow_version_audit,
 }

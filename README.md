@@ -81,5 +81,28 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## DDL字段版本交接
+
+DDL传播不再"先改映射文本、再补演进记录"，而是以可核验的字段版本数据双边落账
+（核心逻辑在 `backend/app/services/field_version.py`）：
+
+- 版本信封：`版本键=源端@影响表`、`版本号`、`列清单`、`来源适配`、`映射指纹`
+  （sha1前12位）。映射侧（`binlog_parse.版本映射`）与演进侧（`schema_evo`记录）
+  持久化同一信封，两边指纹对得上版本才对外生效，其他表的演进不会混入本键序列。
+- 幂等恢复：同一DDL事件重复投递或事务中断恢复时按`来源适配`复用已确认版本，
+  只写入映射的半成品由 `ddl_recovery` 按映射侧信封补做演进写入，不重复产生版本。
+- 消费门禁：开始解码的批次只消费双边核验通过的完整映射；变更处理到一半时
+  自动回退最近一次已确认版本，解析结果同步交接事件转换并附解码依据，
+  刷新转换批次可查到实际采用的列。
+
+新增编排端点：
+
+- `POST /api/flows/parse-decode?rule_id=` 解码批次 → 版本核验 → 同步交接事件转换
+- `POST /api/flows/ddl-recovery?ddl_entry_id=` 中断恢复（补做演进写入/补登映射）
+- `GET /api/flows/version-audit?source=&table=` 交接核对
+  （已有批次能否继续 / 哪些数据以旧版产出 / 新版何时开始被转换消费）
+
+回归：`cd backend && .venv/bin/python -m unittest tests.test_ddl_handoff`
+
 领域：数据工程
 子方向：数仓与数据湖
